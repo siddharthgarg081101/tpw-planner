@@ -23,12 +23,12 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from auth import verify_token
-from echo_plan import build_echo_plan
+from fab_optimizer import build_fab_plan
 
 log = logging.getLogger("planner")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title="TPW Planner", version="0.2.0")
+app = FastAPI(title="TPW Planner", version="0.3.0")
 
 
 # ----------------------------------------------------------------------
@@ -95,10 +95,18 @@ def generate_plan(
     )
 
     try:
-        result = build_echo_plan(
+        result = build_fab_plan(
             horizon_start=req.horizon_start,
             horizon_end=req.horizon_end,
             orders=req.plan_input.get("orders", []),
+            fab_targets=req.tunable.get("fab_targets", []),
+            pc_targets=req.tunable.get("pc_targets", []),
+            fab_changeover=req.tunable.get("fab_changeover_per_sku", []),
+            safety_stock=req.tunable.get("safety_stock", []),
+            working_schedule=req.tunable.get("working_schedule", []),
+            sets_balance_tolerance=req.tunable.get("sets_balance_tolerance", []),
+            tier_weights=req.tunable.get("tier_weights", []),
+            daily_line_count=req.plan_input.get("daily_line_count", []),
             non_working_days=req.tunable.get("non_working_days", []),
             stock=req.stock,
         )
