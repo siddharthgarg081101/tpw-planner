@@ -107,15 +107,27 @@ def _section(plan, idx):
 # ----------------------------------------------------------------------
 # Smoke
 # ----------------------------------------------------------------------
-def test_no_orders_returns_clean_plan_with_overproduction():
-    """With no orders, optimizer fills lines for Tier 3 (keep-lines-busy)."""
+def test_no_orders_no_production_by_default():
+    """Default w_overproduce=0: with no orders, lines idle (no Tier 3 fill)."""
     plan = _call(orders=[])
     assert plan["status"] == "ok"
-    # Section 0 has 5 working days
     assert len(_section(plan, 0)["rows"]) == 5
-    # Section 4 is empty (no orders)
     assert _section(plan, 4)["rows"] == []
-    # Section 6 (UP-level) has production rows (Tier 3 fills lines)
+    # No production at all when no orders + w_overproduce=0.
+    assert _section(plan, 6)["rows"] == []
+
+
+def test_explicit_overproduce_weight_fills_lines():
+    """With w_overproduce>0, the optimizer fills idle capacity with Tier 3."""
+    plan = _call(
+        orders=[],
+        tier_weights=[
+            {"weight_name": "w_order", "value": 1000},
+            {"weight_name": "w_safety", "value": 100},
+            {"weight_name": "w_overproduce", "value": 1},
+            {"weight_name": "w_changeover", "value": 5},
+        ],
+    )
     assert len(_section(plan, 6)["rows"]) > 0
 
 
@@ -154,9 +166,10 @@ def test_opening_stock_reduces_production():
     )
     summary = _section(plan, 4)["rows"]
     row = next(r for r in summary if r[0] == "FG-HIL16-W-F")
-    # row layout: SKU, Name, Order Qty, Stock, Safety, Plan Produces, EOD, Tier, Locked, OverFlag
-    assert row[3] == 800   # opening stock
-    assert row[7] in ("Order", "Safety")  # demand fully met
+    # row layout: SKU, Name, Order Qty, FG Stock, Pipeline, Safety,
+    #             Plan Produces, EOD, Tier, Locked, OverFlag
+    assert row[3] == 800
+    assert row[8] in ("Order", "Safety", "Over")
 
 
 def test_wip_pt_stock_counts_against_pending():
@@ -169,6 +182,36 @@ def test_wip_pt_stock_counts_against_pending():
     hil_f = next(r for r in up_summary if r[0] == "WIP-FG-HIL16-F-UP")
     # Pending (post-WIP) should be 500 not 1000.
     assert abs(hil_f[3] - 500) < 1
+
+
+def test_section4_eod_accounts_for_wip_pt_stock():
+    """Section 4 EOD must include WIP-PT/WIP-UP attribution (Phase 2 flows them to FG).
+
+    Regression test for the 'Short' label that appeared in user's first plan
+    even when the optimizer had fully met UP-level pending. The previous bug:
+    Section 4 EOD = fg_stock + fab_produced - order_qty, ignoring pipeline.
+    """
+    plan = _call(
+        orders=[{"sku_id": "FG-HIL16-W-F", "order_qty": 4000}],
+        stock={
+            "FG-HIL16-W-F": 30,
+            "WIP-FG-HIL16-F-PT": 3085,  # 3,085 pcs sitting in pipeline
+        },
+    )
+    summary = _section(plan, 4)["rows"]
+    row = next(r for r in summary if r[0] == "FG-HIL16-W-F")
+    # Layout: SKU, Name, OrderQty, FGStock, Pipeline, Safety, PlanProduces, EOD, Tier, Locked, OverFlag
+    fg_stock = row[3]
+    pipeline = row[4]
+    fab_produced = row[6]
+    eod = row[7]
+    tier = row[8]
+    # Pipeline attribution should be 3,085 (since this FG is the only one ordered for this UP).
+    assert abs(pipeline - 3085) < 1
+    # EOD = 30 + 3085 + fab_produced - 4000. Should be ≥ 0 because UP-level pending
+    # post-WIP is only 885, and the optimizer must produce at least that.
+    assert eod >= -1
+    assert tier in ("Order", "Safety", "Over"), f"expected non-Short, got {tier}"
 
 
 # ----------------------------------------------------------------------

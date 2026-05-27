@@ -35,10 +35,13 @@ from ortools.sat.python import cp_model
 SCALE = 1000
 
 # Default tier weights — used only if Tunable_TierWeights is empty/missing.
+# w_overproduce defaults to 0: do NOT make pcs beyond order + safety. Phase 2
+# has no PT/PC throughput cap, so a positive Tier-3 weight piles up the highest-
+# rate SKU. Re-enable explicitly via Tunable_TierWeights once Phase 3 lands.
 DEFAULT_WEIGHTS = {
     "w_order": 1000,
     "w_safety": 100,
-    "w_overproduce": 1,
+    "w_overproduce": 0,
     "w_changeover": 5,
 }
 
@@ -495,6 +498,7 @@ def build_fab_plan(
         order_rows=order_rows,
         fg_to_up=fg_to_up,
         changeover_min=changeover_min,
+        stock_lookup=stock,
         horizon_start=horizon_start,
         horizon_end=horizon_end,
         warnings=warnings,
@@ -509,7 +513,7 @@ def _build_output(
     produces, pcs, from_sku, multi, line_active,
     pcs_tier1, pcs_tier2, pcs_tier3,
     up_pending, up_safety, order_rows, fg_to_up,
-    changeover_min,
+    changeover_min, stock_lookup,
     horizon_start, horizon_end, warnings,
 ) -> dict[str, Any]:
 
@@ -560,7 +564,8 @@ def _build_output(
         daily_rows.append([
             d.isoformat(),
             DAY_NAMES[d.weekday()],
-            f"{active_lines}/{cfg['lines_running']}",
+            # "X of Y" (not "X/Y") so Sheets doesn't auto-parse as a date.
+            f"{active_lines} of {cfg['lines_running']}",
             cfg["schedule"],
             day_fab_pcs,
             "",  # PT — Phase 3
@@ -582,32 +587,47 @@ def _build_output(
         if up:
             up_order_qty_total[up] = up_order_qty_total.get(up, 0.0) + r["order_qty"]
 
+    # Pipeline stock per UP = WIP-UP + WIP-PT stock that Phase 2 assumes flows
+    # forward to FG (PT/PC unconstrained). Attributed per-FG by order share.
+    up_pipeline_stock: dict[str, float] = {}
+    for up_sku in fab_skus:
+        pt_sku = up_sku.replace("-UP", "-PT")
+        up_pipeline_stock[up_sku] = (
+            float(stock_lookup.get(up_sku, 0.0)) + float(stock_lookup.get(pt_sku, 0.0))
+        )
+
     summary_rows: list[list[Any]] = []
     for r in order_rows:
         up = r["up"]
         if up is None:
-            attributed = 0.0
+            attributed_fab = 0.0
+            attributed_pipeline = 0.0
             eod = r["opening_stock"] - r["order_qty"]
             tier = "Unmapped"
+            overproduction = False
         else:
             total_q = up_order_qty_total.get(up, 0.0)
             share = (r["order_qty"] / total_q) if total_q > 0 else 0.0
-            attributed = up_total_produced[up] * share
-            eod = r["opening_stock"] + attributed - r["order_qty"]
-            if attributed + r["opening_stock"] >= r["order_qty"] + r["safety"] - 0.01:
-                tier = "Safety"
-            elif attributed + r["opening_stock"] >= r["order_qty"] - 0.01:
-                tier = "Order"
-            else:
+            attributed_fab = up_total_produced[up] * share
+            attributed_pipeline = up_pipeline_stock[up] * share
+            # In Phase 2, pipeline stock + fab output both flow to FG (PT/PC unconstrained).
+            total_available = r["opening_stock"] + attributed_pipeline + attributed_fab
+            eod = total_available - r["order_qty"]
+            if total_available < r["order_qty"] - 0.01:
                 tier = "Short"
-        # Overproduction = UP produced more than (pending + safety) and this FG was credited some of it.
-        if up is not None:
-            overproduction = up_total_produced[up] > (up_pending[up] + up_safety[up]) + 0.01
-        else:
-            overproduction = False
+            elif total_available < r["order_qty"] + r["safety"] - 0.01:
+                tier = "Order"
+            elif total_available <= r["order_qty"] + r["safety"] + 0.5:
+                tier = "Safety"
+            else:
+                tier = "Over"
+            overproduction = (
+                up_total_produced[up] > (up_pending[up] + up_safety[up]) + 0.01
+            )
         summary_rows.append([
             r["sku_id"], r["sku_name"], r["order_qty"], r["opening_stock"],
-            r["safety"], round(attributed, 1), round(eod, 1),
+            round(attributed_pipeline, 1),
+            r["safety"], round(attributed_fab, 1), round(eod, 1),
             tier, r["is_locked"], overproduction,
         ])
 
@@ -664,8 +684,9 @@ def _build_output(
         {
             "section": "Section 4: Per-SKU Horizon Summary (FG orders)",
             "headers": [
-                "SKU ID", "SKU Name", "Order Qty", "Stock Today", "Safety Target",
-                "Plan Produces (attributed)", "EOD Stock", "Tier Reached",
+                "SKU ID", "SKU Name", "Order Qty", "FG Stock",
+                "Pipeline Stock (UP+PT, attrib.)", "Safety Target",
+                "Plan Produces (attributed)", "EOD FG Stock", "Tier Reached",
                 "Locked?", "Overproduction Flag",
             ],
             "rows": summary_rows,
